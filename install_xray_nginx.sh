@@ -1,16 +1,10 @@
 #!/bin/bash
-# Скрипт запускается ПОД root
-# Автоматическая установка Xray + nginx + PROXY protocol
-# Сайт создаётся в /home/$USER/www/$domain
-
 set -e
 
-# --- Ввод домена и пользователя ---
-
+echo ""
 read -p "Введите домен (например, moi-domen.mom): " domain_raw
 read -p "Введите имя пользователя для сайта: " user
 
-# --- Фильтрация домена от мусора (русские буквы, пробелы, невидимые символы) ---
 domain=$(echo "$domain_raw" | tr -cd 'a-zA-Z0-9.-')
 
 if [[ -z "$domain" ]]; then
@@ -20,29 +14,24 @@ fi
 
 echo "Используем домен: $domain"
 
-# --- Создание пользователя, если нет ---
 if ! id "$user" &>/dev/null; then
-  echo "Пользователь $user не найден, создаю..."
+  echo "Создаю пользователя $user..."
   useradd -m -s /bin/bash "$user"
 fi
 
 USER_HOME=$(eval echo "~$user")
 WEB_ROOT="$USER_HOME/www/$domain"
 
-echo "Каталог сайта: $WEB_ROOT"
 mkdir -p "$WEB_ROOT"
 chown -R "$user:$user" "$USER_HOME/www"
 
-# --- Базовые пакеты ---
 apt update
 apt install -y curl wget nginx qrencode jq
 
-# --- ВРЕМЕННЫЙ nginx ДЛЯ ВЫПУСКА СЕРТИФИКАТА ---
 cat << EOF > /etc/nginx/sites-available/default
 server {
     listen 80;
     server_name $domain;
-
     root $WEB_ROOT;
 }
 EOF
@@ -50,33 +39,29 @@ EOF
 nginx -t
 systemctl restart nginx
 
-# --- acme.sh и сертификаты ---
 su - "$user" -c "curl https://get.acme.sh | sh"
 ACME_HOME="$USER_HOME/.acme.sh"
 
 su - "$user" -c "$ACME_HOME/acme.sh --upgrade --auto-upgrade"
 
-# --- Создаём папку для сертификатов ДО установки ---
-mkdir -p /usr/local/etc/xray/xray_cert/
-chmod 755 /usr/local/etc/xray/xray_cert
+mkdir -p /usr/local/etc/xray/xray_cert
+chown -R "$user:$user" /usr/local/etc/xray/xray_cert
+chmod 700 /usr/local/etc/xray/xray_cert
 
-# --- Выпуск сертификата ---
 su - "$user" -c "$ACME_HOME/acme.sh --issue --server letsencrypt -d $domain -w $WEB_ROOT --keylength ec-256 --force"
 
-# --- Установка сертификата ---
 su - "$user" -c "$ACME_HOME/acme.sh --install-cert -d $domain --ecc \
   --fullchain-file /usr/local/etc/xray/xray_cert/xray.crt \
   --key-file /usr/local/etc/xray/xray_cert/xray.key"
 
-chmod +r /usr/local/etc/xray/xray_cert/xray.key
+chmod 600 /usr/local/etc/xray/xray_cert/xray.key
 
-# --- Скрипт автообновления сертификата ---
 cat << EOF > /usr/local/etc/xray/xray_cert/xray-cert-renew
 #!/bin/bash
 su - $user -c "$ACME_HOME/acme.sh --install-cert -d $domain --ecc \
   --fullchain-file /usr/local/etc/xray/xray_cert/xray.crt \
   --key-file /usr/local/etc/xray/xray_cert/xray.key"
-chmod +r /usr/local/etc/xray/xray_cert/xray.key
+chmod 600 /usr/local/etc/xray/xray_cert/xray.key
 systemctl restart xray
 EOF
 
@@ -87,7 +72,6 @@ crontab -l 2>/dev/null | grep -q "xray-cert-renew" || (
   echo "0 1 1 * *   bash /usr/local/etc/xray/xray_cert/xray-cert-renew"
 ) | crontab -
 
-# --- Включаем BBR ---
 bbr=$(sysctl -a 2>/dev/null | grep "net.ipv4.tcp_congestion_control = bbr" || true)
 if [ -z "$bbr" ]; then
   echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
@@ -95,7 +79,6 @@ if [ -z "$bbr" ]; then
   sysctl -p
 fi
 
-# --- Установка Xray ---
 bash -c "$(curl -4 -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
 
 [ -f /usr/local/etc/xray/.keys ] && rm /usr/local/etc/xray/.keys
@@ -108,7 +91,6 @@ echo "shortsid: $shortsid" >> /usr/local/etc/xray/.keys
 echo "uuid: $uuid" >> /usr/local/etc/xray/.keys
 echo "domain: $domain" >> /usr/local/etc/xray/.keys
 
-# --- Конфиг Xray ---
 cat << EOF > /usr/local/etc/xray/config.json
 {
   "dns": {
@@ -167,19 +149,12 @@ cat << EOF > /usr/local/etc/xray/config.json
     }
   ],
   "outbounds": [
-    {
-      "protocol": "freedom",
-      "tag": "direct"
-    },
-    {
-      "protocol": "blackhole",
-      "tag": "block"
-    }
+    { "protocol": "freedom", "tag": "direct" },
+    { "protocol": "blackhole", "tag": "block" }
   ]
 }
 EOF
 
-# --- Основной nginx с PROXY protocol ---
 cat << EOF > /etc/nginx/sites-available/default
 server {
     listen 80;
